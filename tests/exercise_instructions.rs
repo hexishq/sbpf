@@ -439,20 +439,27 @@ fn test_ins(is_v2_only: bool, ins: String, prng: &mut SmallRng, cu: Option<u64>)
         exit"
     );
 
-    let config = Config {
-        enable_register_tracing: true,
-        enabled_sbpf_versions: sbpf_version..=sbpf_version,
-        ..Config::default()
-    };
-    let loader = Arc::new(BuiltinProgram::new_loader(config));
-    let executable = assemble(asm.as_str(), loader).unwrap();
-    let cu = cu
-        .map(|cu| cu.saturating_add(22))
-        .unwrap_or(executable.get_text_bytes().1.len().wrapping_shr(3) as u64);
-    test_interpreter_and_jit!(
-        override_budget => true,
-        executable,
-        &raw mut input,
-        TestContextObject::new(cu),
-    );
+    // Each program starts with ten ldxdw loads from the input region, so running every
+    // exercise under the inline-address-translation config too gives broad randomized
+    // differential coverage of the JIT fast path against the interpreter.
+    for inline_translation in [false, true] {
+        let config = Config {
+            enable_register_tracing: true,
+            aligned_memory_mapping: inline_translation,
+            enable_inline_address_translation: inline_translation,
+            enabled_sbpf_versions: sbpf_version..=sbpf_version,
+            ..Config::default()
+        };
+        let loader = Arc::new(BuiltinProgram::new_loader(config));
+        let executable = assemble(asm.as_str(), loader).unwrap();
+        let cu = cu
+            .map(|cu| cu.saturating_add(22))
+            .unwrap_or(executable.get_text_bytes().1.len().wrapping_shr(3) as u64);
+        test_interpreter_and_jit!(
+            override_budget => true,
+            executable,
+            &raw mut input,
+            TestContextObject::new(cu),
+        );
+    }
 }
