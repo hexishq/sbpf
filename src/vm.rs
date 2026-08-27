@@ -148,9 +148,9 @@ pub struct Config {
     /// miss. Requires `enable_address_translation`; it is ignored by the interpreter. Serves any
     /// address-space slot held by exactly one region (under the unaligned mapping that is stack,
     /// heap and rodata, but not the per-account input sub-regions). The per-execution region tables are snapshotted in
-    /// [`EbpfVm::execute_program`], so the mapping's regions must not be replaced while the
-    /// program runs (i.e. the access violation handler must not grow regions - do not combine
-    /// with account data direct mapping style handlers).
+    /// [`EbpfVm::execute_program`], so a region that could move underneath them is never served
+    /// inline: any region carrying an access-violation-handler payload is left to the slow path,
+    /// which makes this safe to combine with account-data-direct-mapping style handlers.
     pub enable_inline_address_translation: bool,
     /// Allowed [SBPFVersion]s
     pub enabled_sbpf_versions: std::ops::RangeInclusive<SBPFVersion>,
@@ -505,6 +505,16 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
                 continue;
             }
             if regions_per_slot[slot] != 1 {
+                continue;
+            }
+            // Never inline a region the access violation handler can mutate. The handler both
+            // grows `len` and, under account-data direct mapping, REDIRECTS `host_addr` when it
+            // unshares an account (copy on write). These tables are snapshotted once per
+            // execution, so a redirected region would leave the fast path reading the pre-CoW
+            // buffer - stale bytes, or freed memory once the old allocation goes away. Regions
+            // that carry a handler payload are exactly the mutable ones (the serializer sets it
+            // per writable account); stack, heap and rodata never do, so this costs nothing.
+            if region.access_violation_handler_payload.is_some() {
                 continue;
             }
             // Must start exactly at the slot base and stay inside it, so `vm_addr >> 32` is an
