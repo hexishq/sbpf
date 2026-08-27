@@ -442,10 +442,12 @@ fn test_ins(is_v2_only: bool, ins: String, prng: &mut SmallRng, cu: Option<u64>)
     // Each program starts with ten ldxdw loads from the input region, so running every
     // exercise under the inline-address-translation config too gives broad randomized
     // differential coverage of the JIT fast path against the interpreter.
-    for inline_translation in [false, true] {
+    // (inline off), (inline on, aligned mapping), (inline on, unaligned mapping = SIMD-0460 shape)
+    for (inline_translation, aligned) in [(false, true), (true, true), (true, false)] {
         let config = Config {
             enable_register_tracing: true,
-            aligned_memory_mapping: inline_translation,
+            aligned_memory_mapping: aligned,
+            enable_stack_frame_gaps: aligned,
             enable_inline_address_translation: inline_translation,
             enabled_sbpf_versions: sbpf_version..=sbpf_version,
             ..Config::default()
