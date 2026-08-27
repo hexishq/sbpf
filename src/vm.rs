@@ -474,29 +474,33 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         const SLOTS: usize = 8;
         let mut regions_per_slot = [0u8; SLOTS];
         for region in regions.iter() {
-            let slot = (region.vm_addr >> ebpf::VIRTUAL_ADDRESS_BITS) as usize;
+            let slot = (region.vm_addr_range().start >> ebpf::VIRTUAL_ADDRESS_BITS) as usize;
             if let Some(count) = regions_per_slot.get_mut(slot) {
                 *count = count.saturating_add(1);
             }
         }
 
         for region in regions.iter() {
-            let slot = (region.vm_addr >> ebpf::VIRTUAL_ADDRESS_BITS) as usize;
+            let vm_addr = region.vm_addr_range().start;
+            let slot = (vm_addr >> ebpf::VIRTUAL_ADDRESS_BITS) as usize;
             if slot >= SLOTS {
                 continue;
             }
-            if region.vm_gap_shift != 63 {
+            let host = region.host_buffer();
+            let host_addr = host.ptr() as *const u8 as u64;
+            let len = region.len() as u64;
+            let writable = host.is_mutable();
+            if region.gap_size() != 0 {
                 // The gapped stack region is served by the specialized inline path, and only
                 // when the region matches the constants the JIT baked in.
                 if slot == (ebpf::MM_STACK_START >> ebpf::VIRTUAL_ADDRESS_BITS) as usize
-                    && region.writable
+                    && writable
                     && config.stack_frame_size.is_power_of_two()
-                    && u32::from(region.vm_gap_shift)
-                        == (config.stack_frame_size as u64).trailing_zeros()
-                    && region.len == config.stack_size() as u64
+                    && region.gap_size() == config.stack_frame_size as u64
+                    && len == config.stack_size() as u64
                 {
-                    self.inline_stack_host = region.host_addr;
-                    self.inline_stack_len = region.len;
+                    self.inline_stack_host = host_addr;
+                    self.inline_stack_len = len;
                 }
                 continue;
             }
@@ -505,16 +509,16 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
             }
             // Must start exactly at the slot base and stay inside it, so `vm_addr >> 32` is an
             // exact index and the low 32 bits are an exact offset.
-            if region.vm_addr != (slot as u64) << ebpf::VIRTUAL_ADDRESS_BITS
-                || region.len > ebpf::MM_REGION_SIZE
+            if vm_addr != (slot as u64) << ebpf::VIRTUAL_ADDRESS_BITS
+                || len > ebpf::MM_REGION_SIZE
             {
                 continue;
             }
-            self.inline_load_table[slot * 2] = region.host_addr;
-            self.inline_load_table[slot * 2 + 1] = region.len;
-            if region.writable {
-                self.inline_store_table[slot * 2] = region.host_addr;
-                self.inline_store_table[slot * 2 + 1] = region.len;
+            self.inline_load_table[slot * 2] = host_addr;
+            self.inline_load_table[slot * 2 + 1] = len;
+            if writable {
+                self.inline_store_table[slot * 2] = host_addr;
+                self.inline_store_table[slot * 2 + 1] = len;
             }
         }
     }
