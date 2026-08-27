@@ -29,7 +29,7 @@ use solana_sbpf::{
 use std::sync::Arc;
 use test_utils::{
     compare_register_trace, create_vm, test_interpreter_and_jit, test_interpreter_and_jit_asm,
-    TestContextObject,
+    TestContextObject, NO_INPUT,
 };
 
 fn inline_config(sbpf_version: SBPFVersion) -> Config {
@@ -59,43 +59,47 @@ fn test_inline_loads_all_sizes() {
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config(sbpf_version);
         // ldxb of a high-bit byte: also proves zero-extension, not sign-extension.
+        let mut mem_1 = [0xaa, 0xbb, 0x11, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
             ldxb r0, [r1+0]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0x11, 0xcc, 0xdd],
+            &raw mut mem_1,
             TestContextObject::new(3),
             ProgramResult::Ok(0xaa),
         );
+        let mut mem_2 = [0xaa, 0xbb, 0x11, 0x22, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
             ldxh r0, [r1+2]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0x11, 0x22, 0xcc, 0xdd],
+            &raw mut mem_2,
             TestContextObject::new(3),
             ProgramResult::Ok(0x2211),
         );
+        let mut mem_3 = [0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
             ldxw r0, [r1+2]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0xcc, 0xdd],
+            &raw mut mem_3,
             TestContextObject::new(3),
             ProgramResult::Ok(0x44332211),
         );
+        let mut mem_4 = [0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
             ldxdw r0, [r1+2]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd],
+            &raw mut mem_4,
             TestContextObject::new(3),
             ProgramResult::Ok(0x8877665544332211),
         );
@@ -106,6 +110,7 @@ fn test_inline_loads_all_sizes() {
 fn test_inline_stores_all_sizes() {
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config(sbpf_version);
+        let mut mem_5 = [0xaa, 0xbb, 0xff, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -114,10 +119,11 @@ fn test_inline_stores_all_sizes() {
             ldxdw r0, [r1+2]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0xff, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd],
+            &raw mut mem_5,
             TestContextObject::new(5),
             ProgramResult::Ok(0x8877665544332211),
         );
+        let mut mem_6 = [0xaa, 0xbb, 0xff, 0xff, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -126,10 +132,11 @@ fn test_inline_stores_all_sizes() {
             ldxdw r0, [r1+2]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0xff, 0xff, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd],
+            &raw mut mem_6,
             TestContextObject::new(5),
             ProgramResult::Ok(0x8877665544332211),
         );
+        let mut mem_7 = [0xaa, 0xbb, 0xff, 0xff, 0xff, 0xff, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -138,10 +145,11 @@ fn test_inline_stores_all_sizes() {
             ldxdw r0, [r1+2]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0xff, 0xff, 0xff, 0xff, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd],
+            &raw mut mem_7,
             TestContextObject::new(5),
             ProgramResult::Ok(0x8877665544332211),
         );
+        let mut mem_8 = [0xaa, 0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -150,7 +158,7 @@ fn test_inline_stores_all_sizes() {
             ldxdw r0, [r1+2]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xcc, 0xdd],
+            &raw mut mem_8,
             TestContextObject::new(5),
             ProgramResult::Ok(0x44332211),
         );
@@ -162,35 +170,38 @@ fn test_inline_input_boundary() {
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config(sbpf_version);
         // Last valid byte.
+        let mut mem_9 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5a];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
             ldxb r0, [r1+15]
             exit",
             config.clone(),
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5a],
+            &raw mut mem_9,
             TestContextObject::new(3),
             ProgramResult::Ok(0x5a),
         );
         // Last valid dw.
+        let mut mem_10 = [0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0, 0, 0, 0, 0, 0, 0x88];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
             ldxdw r0, [r1+8]
             exit",
             config.clone(),
-            [0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0, 0, 0, 0, 0, 0, 0x88],
+            &raw mut mem_10,
             TestContextObject::new(3),
             ProgramResult::Ok(0x8800000000000011),
         );
         // One byte past the end.
+        let mut mem_11 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
             ldxdw r0, [r1+9]
             exit",
             config.clone(),
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &raw mut mem_11,
             TestContextObject::new(2),
             ProgramResult::Err(EbpfError::AccessViolation(
                 AccessType::Load,
@@ -201,6 +212,7 @@ fn test_inline_input_boundary() {
         );
         // Store one byte past the end. The address begins outside the region, which the
         // stock naming reports as "unallocated".
+        let mut mem_12 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -208,7 +220,7 @@ fn test_inline_input_boundary() {
             stxb [r1+16], r2
             exit",
             config.clone(),
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &raw mut mem_12,
             TestContextObject::new(3),
             ProgramResult::Err(EbpfError::AccessViolation(
                 AccessType::Store,
@@ -234,7 +246,7 @@ fn test_inline_store_to_rodata() {
         stxb [r1], r2
         exit",
         config.clone(),
-        [],
+        NO_INPUT,
         TestContextObject::new(5),
         ProgramResult::Err(EbpfError::AccessViolation(
             AccessType::Store,
@@ -257,7 +269,7 @@ fn test_inline_stack_roundtrip() {
             ldxdw r0, [r10-8]
             exit",
             config.clone(),
-            [],
+            NO_INPUT,
             TestContextObject::new(5),
             ProgramResult::Ok(0x11223344),
         );
@@ -278,7 +290,7 @@ fn test_inline_stack_gap_violation_v0() {
         ldxdw r0, [r1]
         exit",
         config.clone(),
-        [],
+        NO_INPUT,
         TestContextObject::new(5),
         ProgramResult::Err(EbpfError::StackAccessViolation(
             AccessType::Load,
@@ -303,7 +315,7 @@ fn test_inline_stack_no_gaps_v4() {
         ldxdw r0, [r1]
         exit",
         config.clone(),
-        [],
+        NO_INPUT,
         TestContextObject::new(6),
         ProgramResult::Ok(0),
     );
@@ -326,7 +338,7 @@ fn test_inline_stack_gaps_disabled_config() {
         ldxdw r0, [r1]
         exit",
         config.clone(),
-        [],
+        NO_INPUT,
         TestContextObject::new(6),
         ProgramResult::Ok(0),
     );
@@ -338,7 +350,7 @@ fn test_inline_stack_gaps_disabled_config() {
         ldxdw r0, [r10-8]
         exit",
         config.clone(),
-        [],
+        NO_INPUT,
         TestContextObject::new(5),
         ProgramResult::Ok(0x11223344),
     );
@@ -363,7 +375,7 @@ fn test_inline_stack_cross_frame_read_v0() {
         ldxdw r0, [r10-4]
         exit",
         config.clone(),
-        [],
+        NO_INPUT,
         TestContextObject::new(10),
         ProgramResult::Ok(0x112233447abbccdd),
     );
@@ -381,7 +393,7 @@ fn test_inline_region_out_of_range() {
             ldxdw r0, [r1]
             exit",
             config.clone(),
-            [],
+            NO_INPUT,
             TestContextObject::new(4),
             ProgramResult::Err(EbpfError::AccessViolation(
                 AccessType::Load,
@@ -405,7 +417,7 @@ fn test_inline_empty_heap() {
             ldxdw r0, [r1]
             exit",
             config.clone(),
-            [],
+            NO_INPUT,
             TestContextObject::new(4),
             ProgramResult::Err(EbpfError::AccessViolation(
                 AccessType::Load,
@@ -421,6 +433,7 @@ fn test_inline_empty_heap() {
 fn test_inline_store_value_register_aliasing() {
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config(sbpf_version);
+        let mut mem_13 = [0xff];
         // Value in guest r6 (host RBX): the store path must borrow a different temporary.
         test_interpreter_and_jit_asm!(
             "
@@ -430,11 +443,12 @@ fn test_inline_store_value_register_aliasing() {
             ldxb r0, [r1+0]
             exit",
             config.clone(),
-            [0xff],
+            &raw mut mem_13,
             TestContextObject::new(5),
             ProgramResult::Ok(0x66),
         );
         // Value in guest r7 (host R12): the alternative temporary.
+        let mut mem_14 = [0xff];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -443,11 +457,12 @@ fn test_inline_store_value_register_aliasing() {
             ldxb r0, [r1+0]
             exit",
             config.clone(),
-            [0xff],
+            &raw mut mem_14,
             TestContextObject::new(5),
             ProgramResult::Ok(0x77),
         );
         // Address and value in the same register.
+        let mut mem_15 = [0, 0, 0, 0, 0, 0, 0, 0];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -457,7 +472,7 @@ fn test_inline_store_value_register_aliasing() {
             ldxdw r0, [r6]
             exit",
             config.clone(),
-            [0, 0, 0, 0, 0, 0, 0, 0],
+            &raw mut mem_15,
             TestContextObject::new(6),
             ProgramResult::Ok(0x400000000),
         );
@@ -471,6 +486,7 @@ fn test_inline_byte_store_from_high_byte_alias_registers() {
     // is loaded with a poison value whose bits 8-15 would leak if DH were stored.
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config(sbpf_version);
+        let mut mem_16 = [0xff];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -481,7 +497,7 @@ fn test_inline_byte_store_from_high_byte_alias_registers() {
             ldxb r0, [r3+0]
             exit",
             config.clone(),
-            [0xff],
+            &raw mut mem_16,
             TestContextObject::new(7),
             ProgramResult::Ok(0x5c),
         );
@@ -495,7 +511,7 @@ fn test_inline_byte_store_from_high_byte_alias_registers() {
             ldxb r0, [r10-1]
             exit",
             config.clone(),
-            [],
+            NO_INPUT,
             TestContextObject::new(6),
             ProgramResult::Ok(0x7d),
         );
@@ -508,6 +524,7 @@ fn test_inline_load_dst_is_address_source() {
     // aliasing corner (the guest address lives in REGISTER_SCRATCH by then).
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config(sbpf_version);
+        let mut mem_17 = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -515,7 +532,7 @@ fn test_inline_load_dst_is_address_source() {
             mov64 r0, r1
             exit",
             config.clone(),
-            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            &raw mut mem_17,
             TestContextObject::new(4),
             ProgramResult::Ok(0x8877665544332211),
         );
@@ -531,16 +548,18 @@ fn test_inline_load_dst_is_address_source() {
 fn test_inline_unaligned_loads_and_stores() {
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config_unaligned(sbpf_version);
+        let mut mem_18 = [0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
             ldxdw r0, [r1+2]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd],
+            &raw mut mem_18,
             TestContextObject::new(3),
             ProgramResult::Ok(0x8877665544332211),
         );
+        let mut mem_19 = [0xaa, 0xbb, 0xff, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -549,11 +568,12 @@ fn test_inline_unaligned_loads_and_stores() {
             ldxdw r0, [r1+2]
             exit",
             config.clone(),
-            [0xaa, 0xbb, 0xff, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd],
+            &raw mut mem_19,
             TestContextObject::new(5),
             ProgramResult::Ok(0x8877665544332211),
         );
         // Byte store from r1 (host RSI): the high-byte-alias corner, on this mapping too.
+        let mut mem_20 = [0xff];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -564,7 +584,7 @@ fn test_inline_unaligned_loads_and_stores() {
             ldxb r0, [r3+0]
             exit",
             config.clone(),
-            [0xff],
+            &raw mut mem_20,
             TestContextObject::new(7),
             ProgramResult::Ok(0x5c),
         );
@@ -585,7 +605,7 @@ fn test_inline_unaligned_stack_is_inlined() {
             ldxdw r0, [r10-8]
             exit",
             config.clone(),
-            [],
+            NO_INPUT,
             TestContextObject::new(5),
             ProgramResult::Ok(0x11223344),
         );
@@ -611,7 +631,7 @@ fn test_inline_unaligned_stack_end_violation_v0() {
         stxb [r1], r3
         exit",
         config.clone(),
-        [],
+        NO_INPUT,
         TestContextObject::new(7),
         ProgramResult::Err(EbpfError::StackAccessViolation(
             AccessType::Store,
@@ -626,6 +646,7 @@ fn test_inline_unaligned_stack_end_violation_v0() {
 fn test_inline_unaligned_input_boundary_and_violations() {
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config_unaligned(sbpf_version);
+        let mut mem_21 = [0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0, 0, 0, 0, 0, 0, 0x88];
         // Last valid dw, then one past the end.
         test_interpreter_and_jit_asm!(
             "
@@ -633,17 +654,18 @@ fn test_inline_unaligned_input_boundary_and_violations() {
             ldxdw r0, [r1+8]
             exit",
             config.clone(),
-            [0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0, 0, 0, 0, 0, 0, 0x88],
+            &raw mut mem_21,
             TestContextObject::new(3),
             ProgramResult::Ok(0x8800000000000011),
         );
+        let mut mem_22 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
             ldxdw r0, [r1+9]
             exit",
             config.clone(),
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &raw mut mem_22,
             TestContextObject::new(2),
             ProgramResult::Err(EbpfError::AccessViolation(
                 AccessType::Load,
@@ -661,7 +683,7 @@ fn test_inline_unaligned_input_boundary_and_violations() {
             ldxdw r0, [r1]
             exit",
             config.clone(),
-            [],
+            NO_INPUT,
             TestContextObject::new(4),
             ProgramResult::Err(EbpfError::AccessViolation(
                 AccessType::Load,
