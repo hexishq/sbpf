@@ -147,8 +147,9 @@ pub struct Config {
     ///
     /// Guest-visible semantics are unchanged: the fast path admits exactly the accesses the
     /// aligned mapping admits and falls back to the anchors (same errors, same handler) on any
-    /// miss. Requires `aligned_memory_mapping` and `enable_address_translation`; it is ignored
-    /// by the interpreter. The per-execution region tables are snapshotted in
+    /// miss. Requires `enable_address_translation`; it is ignored by the interpreter. Serves any
+    /// address-space slot held by exactly one region (under the unaligned mapping that is stack,
+    /// heap and rodata, but not the per-account input sub-regions). The per-execution region tables are snapshotted in
     /// [`EbpfVm::execute_program`], so the mapping's regions must not be replaced while the
     /// program runs (i.e. the access violation handler must not grow regions - do not combine
     /// with account data direct mapping style handlers).
@@ -461,24 +462,36 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         self.inline_store_table = [0; 16];
         self.inline_stack_host = 0;
         self.inline_stack_len = 0;
-        if !config.aligned_memory_mapping || !config.enable_address_translation {
+        if !config.enable_address_translation {
             return;
         }
         let mapping = unsafe { self.memory_mapping.as_ref() };
-        for (index, region) in mapping.get_regions().iter().enumerate().take(8) {
-            if region.vm_addr != (index as u64) << ebpf::VIRTUAL_ADDRESS_BITS {
-                // Not the aligned-mapping layout (identity or unaligned mapping): stay on
-                // the slow path entirely.
-                self.inline_load_table = [0; 16];
-                self.inline_store_table = [0; 16];
-                self.inline_stack_host = 0;
-                self.inline_stack_len = 0;
-                return;
+        let regions = mapping.get_regions();
+
+        // A slot is inline-servable only when exactly ONE region occupies it, so that indexing by
+        // the top address bits resolves the same region both mappings would. The aligned mapping
+        // guarantees this for every slot (it inserts empty fillers); the unaligned mapping under
+        // SIMD-0460 does NOT - it packs one sub-region per account into the input slot - so that
+        // slot stays on the slow path while stack, heap and rodata (the large majority of a
+        // program's accesses) still go inline.
+        const SLOTS: usize = 8;
+        let mut regions_per_slot = [0u8; SLOTS];
+        for region in regions.iter() {
+            let slot = (region.vm_addr >> ebpf::VIRTUAL_ADDRESS_BITS) as usize;
+            if let Some(count) = regions_per_slot.get_mut(slot) {
+                *count = count.saturating_add(1);
+            }
+        }
+
+        for region in regions.iter() {
+            let slot = (region.vm_addr >> ebpf::VIRTUAL_ADDRESS_BITS) as usize;
+            if slot >= SLOTS {
+                continue;
             }
             if region.vm_gap_shift != 63 {
                 // The gapped stack region is served by the specialized inline path, and only
                 // when the region matches the constants the JIT baked in.
-                if index == (ebpf::MM_STACK_START >> ebpf::VIRTUAL_ADDRESS_BITS) as usize
+                if slot == (ebpf::MM_STACK_START >> ebpf::VIRTUAL_ADDRESS_BITS) as usize
                     && region.writable
                     && config.stack_frame_size.is_power_of_two()
                     && u32::from(region.vm_gap_shift)
@@ -490,14 +503,26 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
                 }
                 continue;
             }
-            if index == 0 && !config.allow_memory_region_zero {
+            if regions_per_slot[slot] != 1 {
                 continue;
             }
-            self.inline_load_table[index * 2] = region.host_addr;
-            self.inline_load_table[index * 2 + 1] = region.len;
+            // Must start exactly at the slot base and stay inside it, so `vm_addr >> 32` is an
+            // exact index and the low 32 bits are an exact offset.
+            if region.vm_addr != (slot as u64) << ebpf::VIRTUAL_ADDRESS_BITS
+                || region.len > ebpf::MM_REGION_SIZE
+            {
+                continue;
+            }
+            // The aligned mapping refuses region zero unless configured otherwise; never let the
+            // inline path admit what the slow path would reject.
+            if slot == 0 && !config.allow_memory_region_zero {
+                continue;
+            }
+            self.inline_load_table[slot * 2] = region.host_addr;
+            self.inline_load_table[slot * 2 + 1] = region.len;
             if region.writable {
-                self.inline_store_table[index * 2] = region.host_addr;
-                self.inline_store_table[index * 2 + 1] = region.len;
+                self.inline_store_table[slot * 2] = region.host_addr;
+                self.inline_store_table[slot * 2 + 1] = region.len;
             }
         }
     }

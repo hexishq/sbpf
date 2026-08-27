@@ -41,6 +41,19 @@ fn inline_config(sbpf_version: SBPFVersion) -> Config {
     }
 }
 
+/// The shape SIMD-0460 produces: the unaligned mapping, no stack frame gaps. Every address-space
+/// slot holding exactly one region (stack, heap, rodata) is still served inline; a slot packed
+/// with several regions (the per-account input sub-regions in production) falls to the anchor.
+fn inline_config_unaligned(sbpf_version: SBPFVersion) -> Config {
+    Config {
+        aligned_memory_mapping: false,
+        enable_stack_frame_gaps: false,
+        enable_inline_address_translation: true,
+        enabled_sbpf_versions: sbpf_version..=sbpf_version,
+        ..Config::default()
+    }
+}
+
 #[test]
 fn test_inline_loads_all_sizes() {
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
@@ -267,7 +280,12 @@ fn test_inline_stack_gap_violation_v0() {
         config.clone(),
         [],
         TestContextObject::new(5),
-        ProgramResult::Err(EbpfError::StackAccessViolation(AccessType::Load, addr, 8, 1)),
+        ProgramResult::Err(EbpfError::StackAccessViolation(
+            AccessType::Load,
+            addr,
+            8,
+            1
+        )),
     );
 }
 
@@ -500,6 +518,157 @@ fn test_inline_load_dst_is_address_source() {
             [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
             TestContextObject::new(4),
             ProgramResult::Ok(0x8877665544332211),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The unaligned mapping (SIMD-0460 shape). Same differential guarantee: the interpreter is the
+// reference, so any divergence in the JIT's inline path fails the test.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_inline_unaligned_loads_and_stores() {
+    for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
+        let config = inline_config_unaligned(sbpf_version);
+        test_interpreter_and_jit_asm!(
+            "
+            add64 r10, 0
+            ldxdw r0, [r1+2]
+            exit",
+            config.clone(),
+            [0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd],
+            TestContextObject::new(3),
+            ProgramResult::Ok(0x8877665544332211),
+        );
+        test_interpreter_and_jit_asm!(
+            "
+            add64 r10, 0
+            mov64 r2, 0x11
+            stxb [r1+2], r2
+            ldxdw r0, [r1+2]
+            exit",
+            config.clone(),
+            [0xaa, 0xbb, 0xff, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd],
+            TestContextObject::new(5),
+            ProgramResult::Ok(0x8877665544332211),
+        );
+        // Byte store from r1 (host RSI): the high-byte-alias corner, on this mapping too.
+        test_interpreter_and_jit_asm!(
+            "
+            add64 r10, 0
+            mov64 r2, 0xEE00
+            mov64 r3, r1
+            mov64 r1, 0x5c
+            stxb [r3+0], r1
+            ldxb r0, [r3+0]
+            exit",
+            config.clone(),
+            [0xff],
+            TestContextObject::new(7),
+            ProgramResult::Ok(0x5c),
+        );
+    }
+}
+
+#[test]
+fn test_inline_unaligned_stack_is_inlined() {
+    // The stack is a single region at MM_STACK_START with no gaps, so it IS inline-servable under
+    // the unaligned mapping - and it is the majority of a real program's accesses.
+    for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
+        let config = inline_config_unaligned(sbpf_version);
+        test_interpreter_and_jit_asm!(
+            "
+            add64 r10, 0
+            mov64 r2, 0x11223344
+            stxdw [r10-8], r2
+            ldxdw r0, [r10-8]
+            exit",
+            config.clone(),
+            [],
+            TestContextObject::new(5),
+            ProgramResult::Ok(0x11223344),
+        );
+    }
+}
+
+#[test]
+fn test_inline_unaligned_stack_end_violation_v0() {
+    // Exactly one byte past the end of the stack region: the inline bounds check must reject it
+    // and hand it to the anchor, which reports the stock violation. V0 only, because the error
+    // shape depends on `manual_stack_frame_bump`. The address is built in a register since the
+    // instruction's signed 16-bit offset cannot reach it from r10.
+    let config = inline_config_unaligned(SBPFVersion::V0);
+    let past_end = ebpf::MM_STACK_START + config.stack_size() as u64;
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        mov64 r1, 2
+        lsh64 r1, 32
+        mov64 r2, 0x40000
+        add64 r1, r2
+        mov64 r3, 1
+        stxb [r1], r3
+        exit",
+        config.clone(),
+        [],
+        TestContextObject::new(7),
+        ProgramResult::Err(EbpfError::StackAccessViolation(
+            AccessType::Store,
+            past_end,
+            1,
+            config.max_call_depth as i64
+        )),
+    );
+}
+
+#[test]
+fn test_inline_unaligned_input_boundary_and_violations() {
+    for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
+        let config = inline_config_unaligned(sbpf_version);
+        // Last valid dw, then one past the end.
+        test_interpreter_and_jit_asm!(
+            "
+            add64 r10, 0
+            ldxdw r0, [r1+8]
+            exit",
+            config.clone(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0, 0, 0, 0, 0, 0, 0x88],
+            TestContextObject::new(3),
+            ProgramResult::Ok(0x8800000000000011),
+        );
+        test_interpreter_and_jit_asm!(
+            "
+            add64 r10, 0
+            ldxdw r0, [r1+9]
+            exit",
+            config.clone(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            TestContextObject::new(2),
+            ProgramResult::Err(EbpfError::AccessViolation(
+                AccessType::Load,
+                0x400000009,
+                8,
+                "input"
+            )),
+        );
+        // Region index past the table.
+        test_interpreter_and_jit_asm!(
+            "
+            add64 r10, 0
+            mov64 r1, 9
+            lsh64 r1, 32
+            ldxdw r0, [r1]
+            exit",
+            config.clone(),
+            [],
+            TestContextObject::new(4),
+            ProgramResult::Err(EbpfError::AccessViolation(
+                AccessType::Load,
+                0x900000000,
+                8,
+                "unallocated"
+            )),
         );
     }
 }

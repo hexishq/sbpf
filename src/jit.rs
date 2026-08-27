@@ -1229,7 +1229,6 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             // on, RBP holds the host frame pointer and must not be clobbered, so fall back to the
             // anchor.
             if self.config.enable_inline_address_translation
-                && self.config.aligned_memory_mapping
                 && !cfg!(feature = "jit-enable-host-stack-frames")
                 && !matches!(value, Some(Value::Constant64(..)))
             {
