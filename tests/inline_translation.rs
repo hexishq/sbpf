@@ -21,10 +21,10 @@ use solana_sbpf::{
     ebpf,
     error::{EbpfError, ProgramResult},
     memory_region::{AccessType, MemoryRegion},
-    program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
+    program::{BuiltinProgram, SBPFVersion},
     static_analysis::Analysis,
     verifier::RequisiteVerifier,
-    vm::{Config, ContextObject},
+    vm::{Config, ContextObject, ExecutionMode},
 };
 use std::sync::Arc;
 use test_utils::{
@@ -693,4 +693,123 @@ fn test_inline_unaligned_input_boundary_and_violations() {
             )),
         );
     }
+}
+
+/// ATTACK (adversarial review): does a mid-execution `host_addr` move reach the inline fast path?
+/// This is exactly what `account_data_direct_mapping` does on first write to a shared account
+/// (`region.redirect(...)` in 0.23). The inline tables are snapshotted once per execution, so a
+/// region that moves afterwards would leave the fast path reading freed/stale host memory.
+/// Reachable only when the moving region is ALONE in its address-space slot.
+#[test]
+fn attack_region_host_addr_moves_mid_execution() {
+    let config = inline_config_unaligned(SBPFVersion::V0);
+    let source = "
+        mov64 r2, 0x11
+        stxb [r1+0], r2
+        ldxb r0, [r1+0]
+        exit";
+
+    let run = |inline: bool| -> u64 {
+        let cfg = Config {
+            enable_inline_address_translation: inline,
+            ..config.clone()
+        };
+        let loader = Arc::new(BuiltinProgram::new_loader(cfg));
+        let executable = assemble::<TestContextObject>(source, loader).unwrap();
+        executable.verify::<RequisiteVerifier>().unwrap();
+        executable.jit_compile().unwrap();
+
+        // Two host buffers: the region starts on `before` (read-only, like a shared account) and
+        // the violation handler flips it to `after` (the CoW unshare). Capture a raw pointer so
+        // the handler stays `Fn` (`AccessViolationHandler` is not `FnMut`).
+        let before: &'static mut [u8] = Box::leak(vec![0xAAu8; 8].into_boxed_slice());
+        let after: &'static mut [u8] = Box::leak(vec![0xBBu8; 8].into_boxed_slice());
+        let after_ptr: *mut [u8] = &raw mut after[..];
+
+        let mut region = MemoryRegion::new(&raw const before[..], ebpf::MM_INPUT_START);
+        region.access_violation_handler_payload = Some(0);
+        let handler: solana_sbpf::memory_region::AccessViolationHandler = Box::new(
+            move |region: &mut MemoryRegion, _reserved, access, _vm_addr, _len| {
+                if access == AccessType::Store {
+                    unsafe {
+                        region.redirect(after_ptr);
+                    }
+                }
+            },
+        );
+
+        let mut context_object = TestContextObject::new(4);
+        create_vm!(
+            vm,
+            &executable,
+            &mut context_object,
+            stack,
+            heap,
+            vec![region],
+            Some(handler)
+        );
+        vm.registers[1] = ebpf::MM_INPUT_START;
+        let mut call_frames = vec![];
+        let (_count, result) = vm.execute_program(
+            &executable,
+            &mut ExecutionMode::Jit,
+            &mut call_frames,
+        );
+        match result {
+            ProgramResult::Ok(v) => v,
+            ProgramResult::Err(e) => panic!("inline={} failed: {:?}", inline, e),
+        }
+    };
+
+    let anchor = run(false);
+    let inline = run(true);
+    assert_eq!(
+        anchor, inline,
+        "inline fast path read stale host memory after the region moved mid-execution \
+         (anchor saw {anchor:#x}, inline saw {inline:#x})"
+    );
+}
+
+#[test]
+fn test_inline_unaligned_with_gaps_still_matches() {
+    // agave ties aligned_memory_mapping and enable_stack_frame_gaps to the same feature, but the
+    // fork allows them independently and this combination reaches the inline path (it used to
+    // early-return on any non-aligned mapping). The gapped-stack block must stay correct here.
+    let config = Config {
+        aligned_memory_mapping: false,
+        enable_stack_frame_gaps: true,
+        enable_inline_address_translation: true,
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        ..Config::default()
+    };
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        mov64 r2, 0x11223344
+        stxdw [r10-8], r2
+        ldxdw r0, [r10-8]
+        exit",
+        config.clone(),
+        NO_INPUT,
+        TestContextObject::new(5),
+        ProgramResult::Ok(0x11223344),
+    );
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        mov64 r1, 2
+        lsh64 r1, 32
+        add64 r1, 4104
+        ldxdw r0, [r1]
+        exit",
+        config.clone(),
+        NO_INPUT,
+        TestContextObject::new(5),
+        ProgramResult::Err(EbpfError::StackAccessViolation(
+            AccessType::Load,
+            ebpf::MM_STACK_START + 4104,
+            8,
+            1
+        )),
+    );
 }
