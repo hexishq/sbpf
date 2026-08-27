@@ -140,6 +140,17 @@ pub struct Config {
     pub optimize_rodata: bool,
     /// Use aligned memory mapping
     pub aligned_memory_mapping: bool,
+    /// Emit an inline bounds-checked fast path for guest memory accesses in the JIT instead of
+    /// calling into `MemoryMapping::load` / `store` through the translation anchors.
+    ///
+    /// Guest-visible semantics are unchanged: the fast path admits exactly the accesses the
+    /// aligned mapping admits and falls back to the anchors (same errors, same handler) on any
+    /// miss. Requires `aligned_memory_mapping` and `enable_address_translation`; it is ignored
+    /// by the interpreter. The per-execution region tables are snapshotted in
+    /// [`EbpfVm::execute_program`], so the mapping's regions must not be replaced while the
+    /// program runs (i.e. the access violation handler must not grow regions - do not combine
+    /// with account data direct mapping style handlers).
+    pub enable_inline_address_translation: bool,
     /// Allowed [SBPFVersion]s
     pub enabled_sbpf_versions: std::ops::RangeInclusive<SBPFVersion>,
 }
@@ -169,6 +180,7 @@ impl Default for Config {
             sanitize_user_provided_values: true,
             optimize_rodata: true,
             aligned_memory_mapping: false,
+            enable_inline_address_translation: false,
             enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V4,
         }
     }
@@ -273,6 +285,14 @@ pub enum RuntimeEnvironmentSlot {
     MemoryMapping = offset_of!(EbpfVm<DummyContextObject>, memory_mapping) as isize,
     /// [EbpfVm::register_trace]
     RegisterTrace = offset_of!(EbpfVm<DummyContextObject>, register_trace) as isize,
+    /// [EbpfVm::inline_load_table]
+    InlineLoadTable = offset_of!(EbpfVm<DummyContextObject>, inline_load_table) as isize,
+    /// [EbpfVm::inline_store_table]
+    InlineStoreTable = offset_of!(EbpfVm<DummyContextObject>, inline_store_table) as isize,
+    /// [EbpfVm::inline_stack_host]
+    InlineStackHost = offset_of!(EbpfVm<DummyContextObject>, inline_stack_host) as isize,
+    /// [EbpfVm::inline_stack_len]
+    InlineStackLen = offset_of!(EbpfVm<DummyContextObject>, inline_stack_len) as isize,
 }
 
 /// A virtual machine to run eBPF programs.
@@ -361,6 +381,18 @@ pub struct EbpfVm<'a, C: ContextObject> {
     pub loader: Arc<BuiltinProgram<C>>,
     /// Collector for the instruction trace
     pub register_trace: Vec<RegisterTraceEntry>,
+    /// Inline address translation (see [Config::enable_inline_address_translation]): per-region
+    /// `[host_addr, len]` pairs indexed by `vm_addr >> 32`, snapshotted from the memory mapping
+    /// at the start of every execution. `len == 0` sends the access through the slow-path
+    /// anchors (out-of-range regions, the gapped stack, and - in the store table - read-only
+    /// regions).
+    pub inline_load_table: [u64; 16],
+    /// Same as [EbpfVm::inline_load_table], for stores.
+    pub inline_store_table: [u64; 16],
+    /// Host base address of the gapped stack region, 0 when absent or mismatched.
+    pub inline_stack_host: u64,
+    /// Host length of the gapped stack region, 0 when absent or mismatched.
+    pub inline_stack_len: u64,
     /// TCP port for the debugger interface
     #[cfg(feature = "debugger")]
     pub debug_port: Option<u16>,
@@ -407,6 +439,60 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
             #[cfg(feature = "debugger")]
             debug_metadata: None,
             register_trace: Vec::default(),
+            inline_load_table: [0; 16],
+            inline_store_table: [0; 16],
+            inline_stack_host: 0,
+            inline_stack_len: 0,
+        }
+    }
+
+    /// Rebuilds the inline-address-translation tables from the current memory mapping.
+    ///
+    /// Runs at the start of every execution when
+    /// [Config::enable_inline_address_translation] is set. Any region that does not match
+    /// what the JIT's inline fast path was compiled for keeps zeroed table rows (or a zeroed
+    /// stack length), which sends every access to it through the slow-path anchors instead -
+    /// never through a wrong inline computation.
+    fn populate_inline_translation_tables(&mut self, config: &Config) {
+        self.inline_load_table = [0; 16];
+        self.inline_store_table = [0; 16];
+        self.inline_stack_host = 0;
+        self.inline_stack_len = 0;
+        if !config.aligned_memory_mapping || !config.enable_address_translation {
+            return;
+        }
+        let mapping = unsafe { self.memory_mapping.as_ref() };
+        for (index, region) in mapping.get_regions().iter().enumerate().take(8) {
+            if region.vm_addr != (index as u64) << ebpf::VIRTUAL_ADDRESS_BITS {
+                // Not the aligned-mapping layout (identity or unaligned mapping): stay on
+                // the slow path entirely.
+                self.inline_load_table = [0; 16];
+                self.inline_store_table = [0; 16];
+                self.inline_stack_host = 0;
+                self.inline_stack_len = 0;
+                return;
+            }
+            if region.vm_gap_shift != 63 {
+                // The gapped stack region is served by the specialized inline path, and only
+                // when the region matches the constants the JIT baked in.
+                if index == (ebpf::MM_STACK_START >> ebpf::VIRTUAL_ADDRESS_BITS) as usize
+                    && region.writable
+                    && config.stack_frame_size.is_power_of_two()
+                    && u32::from(region.vm_gap_shift)
+                        == (config.stack_frame_size as u64).trailing_zeros()
+                    && region.len == config.stack_size() as u64
+                {
+                    self.inline_stack_host = region.host_addr;
+                    self.inline_stack_len = region.len;
+                }
+                continue;
+            }
+            self.inline_load_table[index * 2] = region.host_addr;
+            self.inline_load_table[index * 2 + 1] = region.len;
+            if region.writable {
+                self.inline_store_table[index * 2] = region.host_addr;
+                self.inline_store_table[index * 2 + 1] = region.len;
+            }
         }
     }
 
@@ -433,6 +519,9 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         self.previous_instruction_meter = initial_insn_count;
         self.due_insn_count = 0;
         self.program_result = ProgramResult::Ok(0);
+        if config.enable_inline_address_translation {
+            self.populate_inline_translation_tables(config);
+        }
 
         'execute: {
             match *mode {
@@ -646,5 +735,9 @@ mod tests {
         check_slot!(env, program_result, ProgramResult);
         check_slot!(env, memory_mapping, MemoryMapping);
         check_slot!(env, register_trace, RegisterTrace);
+        check_slot!(env, inline_load_table, InlineLoadTable);
+        check_slot!(env, inline_store_table, InlineStoreTable);
+        check_slot!(env, inline_stack_host, InlineStackHost);
+        check_slot!(env, inline_stack_len, InlineStackLen);
     }
 }

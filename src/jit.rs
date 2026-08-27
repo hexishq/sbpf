@@ -47,6 +47,18 @@ use crate::{
 pub const MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH: usize = 4096;
 /// The maximum machine code length in bytes of a single guest instruction
 pub const MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION: usize = 110;
+/// Per-instruction machine code budget with Config::enable_inline_address_translation: the
+/// inline fast path emits a longer sequence per memory access than the anchor call.
+pub const MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION_INLINE_TRANSLATION: usize = 384;
+
+/// The per-instruction machine code budget the given config compiles under.
+const fn max_machine_code_length_per_instruction(config: &Config) -> usize {
+    if config.enable_inline_address_translation {
+        MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION_INLINE_TRANSLATION
+    } else {
+        MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION
+    }
+}
 /// The maximum machine code length in bytes of an instruction meter checkpoint
 pub const MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT: usize = 24;
 /// The maximum machine code length of the randomized padding
@@ -383,7 +395,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             pc = program.len() / ebpf::INSN_SIZE;
         }
 
-        let mut code_length_estimate = MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH + MAX_START_PADDING_LENGTH + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION * pc;
+        let mut code_length_estimate = MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH + MAX_START_PADDING_LENGTH + max_machine_code_length_per_instruction(config) * pc;
         if config.noop_instruction_rate != 0 {
             code_length_estimate += code_length_estimate / config.noop_instruction_rate as usize;
         }
@@ -430,7 +442,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_subroutines();
 
         while self.pc * ebpf::INSN_SIZE < self.program.len() {
-            if self.offset_in_text_section + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION * 2 >= self.result.text_section.len() {
+            if self.offset_in_text_section + max_machine_code_length_per_instruction(self.config) * 2 >= self.result.text_section.len() {
                 return Err(EbpfError::ExhaustedTextSegment(self.pc));
             }
             let mut insn = ebpf::get_insn_unchecked(self.program, self.pc);
@@ -871,7 +883,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
 
         // Bumper in case there was no final exit
-        if self.offset_in_text_section + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION * 2 >= self.result.text_section.len() {
+        if self.offset_in_text_section + max_machine_code_length_per_instruction(self.config) * 2 >= self.result.text_section.len() {
             return Err(EbpfError::ExhaustedTextSegment(self.pc));
         }
         self.emit_validate_and_profile_instruction_count(self.pc + 1);
@@ -1214,17 +1226,18 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
 
         if self.config.enable_address_translation {
-            let anchor_base = match value {
-                Some(Value::Register(_reg)) => 4,
-                Some(Value::Constant64(_constant, _user_provided)) => 8,
-                _ => 0,
-            };
-            let anchor = ANCHOR_TRANSLATE_MEMORY_ADDRESS + anchor_base + len.trailing_zeros() as usize;
-            // store self.pc in the first stack slot of the anchor
-            self.emit_ins(X86Instruction::store_immediate(OperandSize::S64, RSP, X86IndirectAccess::OffsetIndexShift(-16, RSP, 0), self.pc as i64));
-            self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(anchor, 5)));
-            if let Some(dst) = dst {
-                self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, dst));
+            // The inline fast path uses RBP as a scratch register, which the execution
+            // trampoline only zeroes (frees) when `jit-enable-host-stack-frames` is off; with it
+            // on, RBP holds the host frame pointer and must not be clobbered, so fall back to the
+            // anchor.
+            if self.config.enable_inline_address_translation
+                && self.config.aligned_memory_mapping
+                && !cfg!(feature = "jit-enable-host-stack-frames")
+                && !matches!(value, Some(Value::Constant64(..)))
+            {
+                self.emit_inline_address_translation(dst, len, &value);
+            } else {
+                self.emit_translation_anchor_call(dst, &value, len);
             }
         } else if let Some(dst) = dst {
             match len {
@@ -1261,6 +1274,183 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// The slow translation path: calls the ANCHOR_TRANSLATE_MEMORY_ADDRESS anchor family,
+    /// which routes through MemoryMapping::load / store and owns all error reporting.
+    /// Expects REGISTER_SCRATCH to hold the guest address.
+    fn emit_translation_anchor_call(&mut self, dst: Option<X86Register>, value: &Option<Value>, len: u64) {
+        let anchor_base = match value {
+            Some(Value::Register(_reg)) => 4,
+            Some(Value::Constant64(_constant, _user_provided)) => 8,
+            _ => 0,
+        };
+        let anchor = ANCHOR_TRANSLATE_MEMORY_ADDRESS + anchor_base + len.trailing_zeros() as usize;
+        // store self.pc in the first stack slot of the anchor
+        self.emit_ins(X86Instruction::store_immediate(OperandSize::S64, RSP, X86IndirectAccess::OffsetIndexShift(-16, RSP, 0), self.pc as i64));
+        self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(anchor, 5)));
+        if let Some(dst) = dst {
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, dst));
+        }
+    }
+
+    /// Emits a conditional jump with a zero placeholder and returns the text offset of its
+    /// rel32, to be pointed at the end of text by [Self::patch_local_jumps]. Emitted raw
+    /// (without emit_ins) so no diversification noop lands between opcode and immediate.
+    fn emit_local_cond_jump_placeholder(&mut self, opcode: u8) -> usize {
+        X86Instruction::conditional_jump_immediate(opcode, 0).emit(self);
+        self.offset_in_text_section - mem::size_of::<i32>()
+    }
+
+    /// See [Self::emit_local_cond_jump_placeholder].
+    fn emit_local_jump_placeholder(&mut self) -> usize {
+        X86Instruction::jump_immediate(0).emit(self);
+        self.offset_in_text_section - mem::size_of::<i32>()
+    }
+
+    /// Points every placeholder at the current end of the text section.
+    fn patch_local_jumps(&mut self, patch_positions: &[usize]) {
+        for &position in patch_positions {
+            let relative = (self.offset_in_text_section as i64
+                - (position + mem::size_of::<i32>()) as i64) as i32;
+            self.result.text_section[position..position + mem::size_of::<i32>()]
+                .copy_from_slice(&relative.to_le_bytes());
+        }
+    }
+
+    /// The sized access itself, at [base + indirect].
+    fn emit_inline_access(
+        &mut self,
+        dst: Option<X86Register>,
+        value: &Option<Value>,
+        base: X86Register,
+        indirect: X86IndirectAccess,
+        len: u64,
+    ) {
+        let size = match len {
+            1 => OperandSize::S8,
+            2 => OperandSize::S16,
+            4 => OperandSize::S32,
+            8 => OperandSize::S64,
+            _ => unreachable!(),
+        };
+        if let Some(dst) = dst {
+            self.emit_ins(X86Instruction::load(size, base, dst, indirect));
+        } else if let Some(Value::Register(reg)) = value {
+            self.emit_ins(X86Instruction::store(size, *reg, base, indirect));
+        } else {
+            debug_assert!(false, "inline access needs a load dst or a register store value");
+        }
+    }
+
+    /// Inline fast path for guest memory accesses (Config::enable_inline_address_translation).
+    ///
+    /// Expects REGISTER_SCRATCH to hold the guest address and keeps it intact on every path
+    /// into the slow-path anchor, which redoes the translation through MemoryMapping and owns
+    /// all error reporting. The fast path admits exactly what the aligned mapping admits:
+    /// region index in bounds, offset + len within the region length (a zeroed table row - an
+    /// absent region, the gapped stack in the generic table, or a read-only region in the
+    /// store table - can never pass), and for the gapped stack the same begin-not-in-gap and
+    /// gapped-end-in-bounds checks vm_to_host performs. Tables are snapshotted per execution
+    /// by EbpfVm::populate_inline_translation_tables; a snapshot that does not match the
+    /// mapping stays zeroed and only costs speed, never admits a wrong access.
+    ///
+    /// Register budget: RBP is saved and zeroed by the execution trampoline and absent from
+    /// REGISTER_MAP, so it is a free temporary. Loads use dst as the second temporary (it is
+    /// overwritten on success and rewritten by the anchor on the slow path); stores borrow a
+    /// guest register and spill it to an otherwise unused stack slot around the access.
+    fn emit_inline_address_translation(
+        &mut self,
+        dst: Option<X86Register>,
+        len: u64,
+        value: &Option<Value>,
+    ) {
+        let value_reg = match value {
+            Some(Value::Register(reg)) => Some(*reg),
+            None => None,
+            _ => {
+                debug_assert!(false, "constant store values take the anchor path");
+                None
+            }
+        };
+        let (temp, spilled_temp) = match dst {
+            Some(dst) => (dst, false),
+            None => {
+                let reg = if value_reg == Some(REGISTER_MAP[6]) {
+                    REGISTER_MAP[7]
+                } else {
+                    REGISTER_MAP[6]
+                };
+                (reg, true)
+            }
+        };
+        let temp_spill_slot = X86IndirectAccess::OffsetIndexShift(-104, RSP, 0);
+        if spilled_temp {
+            self.emit_ins(X86Instruction::store(OperandSize::S64, temp, RSP, temp_spill_slot));
+        }
+        let table_disp = self.slot_in_vm(if dst.is_some() {
+            RuntimeEnvironmentSlot::InlineLoadTable
+        } else {
+            RuntimeEnvironmentSlot::InlineStoreTable
+        });
+        let mut to_cold = Vec::new();
+        let mut to_done = Vec::new();
+
+        // RBP = region index
+        self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RBP));
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, RBP, ebpf::VIRTUAL_ADDRESS_BITS as i64, None));
+
+        if self.config.enable_stack_frame_gaps && self.config.stack_frame_size.is_power_of_two() {
+            // The gapped stack region: the dominant target in practice, with compile-time gap
+            // geometry. Zeroed InlineStackLen (region mismatch) falls through to the anchor.
+            self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, RBP, (ebpf::MM_STACK_START >> ebpf::VIRTUAL_ADDRESS_BITS) as i64, None));
+            let to_generic = self.emit_local_cond_jump_placeholder(0x85); // jne
+            self.emit_ins(X86Instruction::mov(OperandSize::S32, REGISTER_SCRATCH, temp)); // temp = offset (zero-extended)
+            self.emit_ins(X86Instruction::test_immediate(OperandSize::S32, temp, self.config.stack_frame_size as i64, None));
+            to_cold.push(self.emit_local_cond_jump_placeholder(0x85)); // jnz: begin is in a gap
+            // gapped_offset = offset - ((offset & !(2 * frame_size - 1)) >> 1)
+            let gap_mask = !((self.config.stack_frame_size as u32) * 2 - 1);
+            self.emit_ins(X86Instruction::mov(OperandSize::S32, temp, RBP));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, RBP, gap_mask as i32 as i64, None)); // and
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0xc1, 5, RBP, 1, None)); // shr 1
+            self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x29, RBP, temp, None)); // temp -= RBP
+            self.emit_ins(X86Instruction::lea(OperandSize::S64, temp, temp, Some(X86IndirectAccess::OffsetIndexShift(len as i32, RSP, 0)))); // temp = gapped_offset + len (RSP index = none, any base)
+            self.emit_ins(X86Instruction::cmp(OperandSize::S64, temp, REGISTER_PTR_TO_VM, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::InlineStackLen)))));
+            to_cold.push(self.emit_local_cond_jump_placeholder(0x82)); // jb: stack_len < gapped_offset + len
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x03, temp, REGISTER_PTR_TO_VM, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::InlineStackHost))))); // temp += stack host base
+            // RSP as SIB index encodes "no index": plain Offset cannot address a base with
+            // low bits 0b100 (R12, a possible store temporary).
+            self.emit_inline_access(dst, value, temp, X86IndirectAccess::OffsetIndexShift(-(len as i32), RSP, 0), len);
+            if spilled_temp {
+                self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, temp, temp_spill_slot));
+            }
+            to_done.push(self.emit_local_jump_placeholder());
+            self.patch_local_jumps(&[to_generic]);
+        }
+
+        // Non-gapped regions through the descriptor table (16 bytes per region: host, len).
+        self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, RBP, 8, None));
+        to_cold.push(self.emit_local_cond_jump_placeholder(0x83)); // jae: region index out of table
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, RBP, 4, None)); // RBP = index * 16
+        self.emit_ins(X86Instruction::mov(OperandSize::S32, REGISTER_SCRATCH, temp)); // temp = offset (zero-extended)
+        self.emit_ins(X86Instruction::lea(OperandSize::S64, temp, temp, Some(X86IndirectAccess::OffsetIndexShift(len as i32, RSP, 0)))); // temp = offset + len (RSP index = none, any base)
+        self.emit_ins(X86Instruction::cmp(OperandSize::S64, temp, REGISTER_PTR_TO_VM, Some(X86IndirectAccess::OffsetIndexShift(table_disp + 8, RBP, 0))));
+        to_cold.push(self.emit_local_cond_jump_placeholder(0x82)); // jb: len < offset + len (zeroed rows always land here)
+        self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, RBP, X86IndirectAccess::OffsetIndexShift(table_disp, RBP, 0))); // RBP = host base
+        self.emit_inline_access(dst, value, RBP, X86IndirectAccess::OffsetIndexShift(-(len as i32), temp, 0), len);
+        if spilled_temp {
+            self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, temp, temp_spill_slot));
+        }
+        to_done.push(self.emit_local_jump_placeholder());
+
+        // Slow path: REGISTER_SCRATCH still holds the untouched guest address. Restore the
+        // spilled register first - the anchor's Rust call clobbers the red zone.
+        self.patch_local_jumps(&to_cold);
+        if spilled_temp {
+            self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, temp, temp_spill_slot));
+        }
+        self.emit_translation_anchor_call(dst, value, len);
+        self.patch_local_jumps(&to_done);
     }
 
     fn emit_conditional_branch_reg(&mut self, size: OperandSize, op: u8, bitwise: bool, first_operand: X86Register, second_operand: X86Register, target_pc: usize) {

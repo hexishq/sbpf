@@ -175,7 +175,14 @@ impl X86Instruction {
         }
         let rex =
             ((rex.w as u8) << 3) | ((rex.r as u8) << 2) | ((rex.x as u8) << 1) | (rex.b as u8);
-        if rex != 0 {
+        // An 8-bit register operand with encoding 4-7 selects AH/CH/DH/BH unless any REX
+        // prefix is present (which reselects SPL/BPL/SIL/DIL). Force an empty REX so an 8-bit
+        // store from RSI/RDI/RBP/RSP writes the intended register's low byte.
+        let force_rex = matches!(self.size, OperandSize::S8)
+            && self.modrm
+            && ((4..8).contains(&(self.first_operand & 0b1111))
+                || (self.indirect.is_none() && (4..8).contains(&(self.second_operand & 0b1111))));
+        if rex != 0 || force_rex {
             jit.emit::<u8>(0x40 | rex);
         }
         match self.opcode_escape_sequence {
