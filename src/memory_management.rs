@@ -60,14 +60,14 @@ impl FreeList {
     /// Returned memory has read-write permissions and may contain arbitrary
     /// bytes left over from a previous owner; the caller should not assume
     /// any particular contents.
-    fn alloc(&self) -> (*mut u8, usize) {
+    fn alloc(&self) -> Result<(*mut u8, usize), EbpfError> {
         let ptr = { self.mem.lock().unwrap_or_else(|e| e.into_inner()).pop() };
         let ptr = match ptr {
             Some(ptr) => ptr,
-            None => unsafe { allocate_pages(self.size) }.expect("allocation failed"),
+            None => unsafe { allocate_pages(self.size) }?,
         };
 
-        (ptr, self.size)
+        Ok((ptr, self.size))
     }
 
     /// Free the given allocation, returning it to the pool.
@@ -172,8 +172,19 @@ impl BucketedFreeList {
 
     /// Allocate memory of at least the given size, returning a pointer to the allocation
     /// and the actual size allocated.
-    fn alloc(&self, size: usize) -> (*mut u8, usize) {
-        self.buckets[Self::bucket_idx(size)].alloc()
+    ///
+    /// A request above [`BUCKET_MAX`] (a JIT text estimate for a very large program) is
+    /// not pooled: it gets its own mapping, sized to the page, and goes back to the OS
+    /// on [`BucketedFreeList::free`].
+    fn alloc(&self, size: usize) -> Result<(*mut u8, usize), EbpfError> {
+        match self.buckets.get(Self::bucket_idx(size)) {
+            Some(bucket) => bucket.alloc(),
+            None => {
+                let size = round_to_page_size(size, get_system_page_size());
+                let ptr = unsafe { allocate_pages(size) }?;
+                Ok((ptr, size))
+            }
+        }
     }
 
     /// Free the given allocation, returning it to the pool.
@@ -186,7 +197,14 @@ impl BucketedFreeList {
     ///   `free`; subsequent `alloc` calls may hand the same memory to another
     ///   owner.
     unsafe fn free(&self, ptr: *mut u8, size: usize) {
-        unsafe { self.buckets[Self::bucket_idx(size)].free(ptr, size) }
+        match self.buckets.get(Self::bucket_idx(size)) {
+            Some(bucket) => unsafe { bucket.free(ptr, size) },
+            None => {
+                if let Err(e) = unsafe { free_pages(ptr, size) } {
+                    log::error!("BucketedFreeList: unable to free oversized allocation {e}");
+                }
+            }
+        }
     }
 }
 
@@ -194,7 +212,7 @@ static ALLOCATOR: LazyLock<BucketedFreeList> = LazyLock::new(BucketedFreeList::n
 
 /// Allocate memory of at least the given size, returning a pointer to the allocation
 /// and the actual size allocated.
-pub fn allocate_pages_pooled(size: usize) -> (*mut u8, usize) {
+pub fn allocate_pages_pooled(size: usize) -> Result<(*mut u8, usize), EbpfError> {
     ALLOCATOR.alloc(size)
 }
 
@@ -386,4 +404,26 @@ pub unsafe fn madvise(raw: *mut u8, size_in_bytes: usize, advice: Advice) -> Res
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod pooled_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_request_gets_its_own_mapping() {
+        let size = BUCKET_MAX.saturating_add(1);
+        let (ptr, allocated) = allocate_pages_pooled(size).expect("mmap");
+        assert!(!ptr.is_null());
+        assert!(allocated >= size);
+        assert_eq!(allocated % get_system_page_size(), 0);
+        unsafe { free_pages_pooled(ptr, allocated) };
+    }
+
+    #[test]
+    fn bucketed_request_rounds_to_the_bucket() {
+        let (ptr, allocated) = allocate_pages_pooled(BUCKET_MIN.saturating_add(1)).expect("mmap");
+        assert_eq!(allocated, BUCKET_MIN.saturating_mul(2));
+        unsafe { free_pages_pooled(ptr, allocated) };
+    }
 }
