@@ -85,7 +85,7 @@ impl JitProgram {
         let pc_loc_table_size = round_to_page_size(pc * std::mem::size_of::<u32>(), page_size);
         let over_allocated_code_size = round_to_page_size(code_size, page_size);
         let (raw, allocation_size) =
-            allocate_pages_pooled(pc_loc_table_size + over_allocated_code_size);
+            allocate_pages_pooled(pc_loc_table_size.saturating_add(over_allocated_code_size))?;
 
         unsafe {
             let pc_section = std::slice::from_raw_parts_mut(raw.cast::<u32>(), pc);
