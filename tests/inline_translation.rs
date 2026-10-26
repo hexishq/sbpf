@@ -92,7 +92,9 @@ fn test_inline_loads_all_sizes() {
             TestContextObject::new(3),
             ProgramResult::Ok(0x44332211),
         );
-        let mut mem_4 = [0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
+        let mut mem_4 = [
+            0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd,
+        ];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -110,7 +112,9 @@ fn test_inline_loads_all_sizes() {
 fn test_inline_stores_all_sizes() {
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config(sbpf_version);
-        let mut mem_5 = [0xaa, 0xbb, 0xff, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
+        let mut mem_5 = [
+            0xaa, 0xbb, 0xff, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd,
+        ];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -123,7 +127,9 @@ fn test_inline_stores_all_sizes() {
             TestContextObject::new(5),
             ProgramResult::Ok(0x8877665544332211),
         );
-        let mut mem_6 = [0xaa, 0xbb, 0xff, 0xff, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
+        let mut mem_6 = [
+            0xaa, 0xbb, 0xff, 0xff, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd,
+        ];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -136,7 +142,9 @@ fn test_inline_stores_all_sizes() {
             TestContextObject::new(5),
             ProgramResult::Ok(0x8877665544332211),
         );
-        let mut mem_7 = [0xaa, 0xbb, 0xff, 0xff, 0xff, 0xff, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
+        let mut mem_7 = [
+            0xaa, 0xbb, 0xff, 0xff, 0xff, 0xff, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd,
+        ];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -149,7 +157,9 @@ fn test_inline_stores_all_sizes() {
             TestContextObject::new(5),
             ProgramResult::Ok(0x8877665544332211),
         );
-        let mut mem_8 = [0xaa, 0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xcc, 0xdd];
+        let mut mem_8 = [
+            0xaa, 0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xcc, 0xdd,
+        ];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -548,7 +558,9 @@ fn test_inline_load_dst_is_address_source() {
 fn test_inline_unaligned_loads_and_stores() {
     for sbpf_version in [SBPFVersion::V0, SBPFVersion::V4] {
         let config = inline_config_unaligned(sbpf_version);
-        let mut mem_18 = [0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
+        let mut mem_18 = [
+            0xaa, 0xbb, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd,
+        ];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -559,7 +571,9 @@ fn test_inline_unaligned_loads_and_stores() {
             TestContextObject::new(3),
             ProgramResult::Ok(0x8877665544332211),
         );
-        let mut mem_19 = [0xaa, 0xbb, 0xff, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd];
+        let mut mem_19 = [
+            0xaa, 0xbb, 0xff, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xcc, 0xdd,
+        ];
         test_interpreter_and_jit_asm!(
             "
             add64 r10, 0
@@ -750,11 +764,8 @@ fn attack_region_host_addr_moves_mid_execution() {
         );
         vm.registers[1] = ebpf::MM_INPUT_START;
         let mut call_frames = vec![];
-        let (_count, result) = vm.execute_program(
-            &executable,
-            &mut ExecutionMode::Jit,
-            &mut call_frames,
-        );
+        let (_count, result) =
+            vm.execute_program(&executable, &mut ExecutionMode::Jit, &mut call_frames);
         match result {
             ProgramResult::Ok(v) => v,
             ProgramResult::Err(e) => panic!("inline={} failed: {:?}", inline, e),

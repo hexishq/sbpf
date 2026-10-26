@@ -487,7 +487,7 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
                 continue;
             }
             let host = region.host_buffer();
-            let host_addr = host.ptr() as *const u8 as u64;
+            let host_addr = host.ptr().cast::<u8>() as u64;
             let len = region.len() as u64;
             let writable = host.is_mutable();
             if region.gap_size() != 0 {
@@ -519,8 +519,7 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
             }
             // Must start exactly at the slot base and stay inside it, so `vm_addr >> 32` is an
             // exact index and the low 32 bits are an exact offset.
-            if vm_addr != (slot as u64) << ebpf::VIRTUAL_ADDRESS_BITS
-                || len > ebpf::MM_REGION_SIZE
+            if vm_addr != (slot as u64) << ebpf::VIRTUAL_ADDRESS_BITS || len > ebpf::MM_REGION_SIZE
             {
                 continue;
             }
